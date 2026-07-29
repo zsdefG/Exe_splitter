@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+exe_splitter.py - 将 exe 拆分为多个分片，并生成可自动合并运行的启动器。
+
+用法:
+    python exe_splitter.py <exe路径> [--chunk-size SIZE_MB] [--output-dir DIR]
+
+示例:
+    python exe_splitter.py "Plain Craft Launcher 2.exe" --chunk-size 2
+"""
+
+import argparse
+import hashlib
+import math
+import sys
+from pathlib import Path
+
+READ_BUFFER = 1024 * 1024  # 1 MB
+
+
+def calculate_sha256(file_path: Path) -> str:
+    """流式计算文件 SHA256，避免大文件一次性读入内存。"""
+    sha = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            data = f.read(READ_BUFFER)
+            if not data:
+                break
+            sha.update(data)
+    return sha.hexdigest()
+
+
+def split_file(exe_path: Path, chunk_size: int, output_dir: Path) -> list:
+    """
+    将文件按 chunk_size 字节拆分为多个 .part 分片。
+
+    命名规则: {文件名(去扩展名)}.part0000.bin, part0001.bin, ...
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_name = exe_path.stem
+
+    chunk_paths = []
+    index = 0
+
+    with open(exe_path, "rb") as f:
+        while True:
+            data = f.read(chunk_size)
+            if not data:
+                break
+            chunk_name = "{}.part{:04d}.bin".format(base_name, index)
+            chunk_path = output_dir / chunk_name
+            with open(chunk_path, "wb") as cf:
+                cf.write(data)
+            chunk_paths.append(chunk_path)
+            index += 1
+
+    return chunk_paths
+
+
+def generate_launcher(original_name, file_hash, chunk_count, base_name, output_dir):
+    """生成 launcher.py 启动器脚本，元数据以占位符替换注入。"""
+
+    template = r'''#!/usr/bin/env python3
+"""
+launcher.py - 自动生成的启动器
+将分片合并为原始 exe 并执行。
+
+原始文件: __ORIGINAL_NAME__
+分片数量: __CHUNK_COUNT__
+SHA256:   __FILE_HASH__
+"""
+
+import hashlib
+import os
+import sys
+import tempfile
+import subprocess
+from pathlib import Path
+
+# ====== 元数据（由 exe_splitter.py 注入）======
+ORIGINAL_NAME = "__ORIGINAL_NAME__"
+FILE_HASH = "__FILE_HASH__"
+CHUNK_COUNT = __CHUNK_COUNT__
+BASE_NAME = "__BASE_NAME__"
+
+
+def find_chunks(directory):
+    """按编号顺序查找所有分片文件，缺失则报错退出。"""
+    chunks = []
+    for i in range(CHUNK_COUNT):
+        name = "{}.part{:04d}.bin".format(BASE_NAME, i)
+        path = directory / name
+        if not path.exists():
+            print("错误: 找不到分片文件 {}".format(name))
+            sys.exit(1)
+        chunks.append(path)
+    return chunks
+
+
+def reassemble(chunks, output_path):
+    """
+    将分片流式合并到 output_path，同时计算 SHA256。
+    返回合并后文件的哈希值。
+    """
+    sha = hashlib.sha256()
+    with open(output_path, "wb") as out:
+        for cp in chunks:
+            with open(cp, "rb") as f:
+                while True:
+                    data = f.read(1024 * 1024)
+                    if not data:
+                        break
+                    out.write(data)
+                    sha.update(data)
+    return sha.hexdigest()
+
+
+def main():
+    script_dir = Path(__file__).parent
+
+    print("正在查找分片 (共 {} 个)...".format(CHUNK_COUNT))
+    chunks = find_chunks(script_dir)
+
+    # 写入临时目录
+    temp_dir = Path(tempfile.mkdtemp(prefix="exe_launcher_"))
+    exe_path = temp_dir / ORIGINAL_NAME
+
+    print("正在合并到临时文件: {}".format(exe_path))
+    actual_hash = reassemble(chunks, exe_path)
+
+    size = os.path.getsize(exe_path)
+    print("合并完成, 大小: {:.2f} MB".format(size / 1024 / 1024))
+
+    print("正在校验完整性 (SHA256)...")
+    if actual_hash != FILE_HASH:
+        print("错误: 校验失败! 合并文件与原始文件不匹配。")
+        print("  期望: {}".format(FILE_HASH))
+        print("  实际: {}".format(actual_hash))
+        sys.exit(1)
+    print("校验通过")
+
+    print("启动程序: {}".format(ORIGINAL_NAME))
+    if sys.platform == "win32":
+        os.startfile(str(exe_path))
+    else:
+        os.chmod(str(exe_path), 0o755)
+        subprocess.Popen([str(exe_path)])
+
+    print("")
+    print("程序已启动。")
+    print("临时文件目录: {}".format(temp_dir))
+    print("如需清理, 请在程序关闭后删除上述目录。")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    code = template
+    code = code.replace("__ORIGINAL_NAME__", original_name)
+    code = code.replace("__FILE_HASH__", file_hash)
+    code = code.replace("__CHUNK_COUNT__", str(chunk_count))
+    code = code.replace("__BASE_NAME__", base_name)
+
+    launcher_path = output_dir / "launcher.py"
+    with open(launcher_path, "w", encoding="utf-8") as f:
+        f.write(code)
+    return launcher_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="将 exe 拆分为多个分片，并生成可自动合并运行的启动器脚本。"
+    )
+    parser.add_argument("exe_path", type=str, help="要拆分的 exe 文件路径")
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10,
+        help="每个分片大小 (MB), 默认 10",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="输出目录, 默认在 exe 同级目录下创建 _parts 文件夹",
+    )
+
+    args = parser.parse_args()
+
+    exe_path = Path(args.exe_path).resolve()
+
+    # --- 输入校验 ---
+    if not exe_path.exists():
+        print("错误: 文件不存在: {}".format(exe_path))
+        sys.exit(1)
+    if not exe_path.is_file():
+        print("错误: 路径不是文件: {}".format(exe_path))
+        sys.exit(1)
+    if args.chunk_size <= 0:
+        print("错误: 分片大小必须大于 0")
+        sys.exit(1)
+
+    # --- 输出目录 ---
+    if args.output_dir:
+        output_dir = Path(args.output_dir).resolve()
+    else:
+        output_dir = exe_path.parent / "{}_parts".format(exe_path.stem)
+
+    chunk_size_bytes = args.chunk_size * 1024 * 1024
+    file_size = exe_path.stat().st_size
+
+    # --- 打印信息 ---
+    print("源文件: {}".format(exe_path.name))
+    print("大小: {:.2f} MB ({} bytes)".format(file_size / 1024 / 1024, file_size))
+
+    print("正在计算 SHA256...")
+    file_hash = calculate_sha256(exe_path)
+    print("SHA256: {}".format(file_hash))
+
+    expected_chunks = math.ceil(file_size / chunk_size_bytes)
+    print("分片大小: {} MB".format(args.chunk_size))
+    print("预计分片数: {}".format(expected_chunks))
+    print("输出目录: {}".format(output_dir))
+    print("")
+
+    # --- 拆分 ---
+    print("正在拆分...")
+    chunk_paths = split_file(exe_path, chunk_size_bytes, output_dir)
+
+    print("拆分完成, 共 {} 个分片:".format(len(chunk_paths)))
+    for i, cp in enumerate(chunk_paths):
+        sz = cp.stat().st_size
+        print("  [{}/{}] {}  ({:.2f} MB)".format(
+            i + 1, len(chunk_paths), cp.name, sz / 1024 / 1024))
+
+    # --- 生成启动器 ---
+    print("")
+    print("正在生成启动器...")
+    launcher_path = generate_launcher(
+        original_name=exe_path.name,
+        file_hash=file_hash,
+        chunk_count=len(chunk_paths),
+        base_name=exe_path.stem,
+        output_dir=output_dir,
+    )
+    print("启动器: {}".format(launcher_path))
+
+    print("")
+    print("========== 使用说明 ==========")
+    print("1. 将 {} 文件夹整体复制到目标位置".format(output_dir.name))
+    print("2. 运行: python launcher.py")
+    print("3. 启动器自动合并分片 -> 校验 SHA256 -> 执行程序")
+    print("==============================")
+
+
+if __name__ == "__main__":
+    main()
